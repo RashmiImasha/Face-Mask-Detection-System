@@ -1,10 +1,14 @@
 import streamlit as st
 import cv2
-import numpy as np
-from tensorflow.keras.models import load_model
-from tensorflow.keras.applications.mobilenet_v2 import preprocess_input
-from tensorflow.keras.preprocessing.image import img_to_array
-import tempfile
+
+from detection_utils import (
+    detect_and_predict_mask,
+    draw_detection_results,
+    resize_frame,
+)
+from alert_system import AlertSystem
+from model_loader import load_models
+
 
 # Page configuration
 st.set_page_config(
@@ -64,13 +68,22 @@ st.markdown("""
         box-shadow: 0 10px 40px rgba(0,0,0,0.2);
         margin: 1rem 0;
     }
-    .info-box {
-        background: rgba(255, 255, 255, 0.95);
+    .alert-box {
+        background: rgba(239, 68, 68, 0.95);
         padding: 1.5rem;
         border-radius: 15px;
-        border-left: 5px solid #667eea;
+        border-left: 5px solid #dc2626;
         margin: 1rem 0;
         box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+        color: white;
+        font-size: 1.2rem;
+        font-weight: bold;
+        text-align: center;
+        animation: pulse 1s infinite;
+    }
+    @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50% { opacity: 0.7; }
     }
     .stButton>button {
         width: 100%;
@@ -88,70 +101,12 @@ st.markdown("""
         transform: translateY(-2px);
         box-shadow: 0 6px 20px rgba(0,0,0,0.3);
     }
-    .mask-icon {
-        font-size: 4rem;
-        text-align: center;
-    }
     </style>
 """, unsafe_allow_html=True)
 
-# Load model
-@st.cache_resource
-def load_models():
-    face_net = cv2.dnn.readNet(
-        "face_detector/deploy.prototxt",
-        "face_detector/res10_300x300_ssd_iter_140000.caffemodel"
-    )
-    mask_net = load_model("mask_detector.model.h5")
-    return face_net, mask_net
 
-# Face detection and mask prediction
-def detect_and_predict_mask(frame, face_net, mask_net):
-    (h, w) = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(frame, 1.0, (300, 300), (104.0, 177.0, 123.0))
-
-    face_net.setInput(blob)
-    detections = face_net.forward()
-    
-    faces = []
-    locations = []
-    predictions = []
-
-    for i in range(0, detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-
-        if confidence > 0.5:
-            box = detections[0, 0, i, 3:7] * np.array([w, h, w, h])
-            (startX, startY, endX, endY) = box.astype("int")
-
-            (startX, startY) = (max(0, startX), max(0, startY))
-            (endX, endY) = (min(w - 1, endX), min(h - 1, endY))
-
-            face = frame[startY:endY, startX:endX]
-
-            if face.size == 0:
-                continue
-            face = cv2.cvtColor(face, cv2.COLOR_BGR2RGB)
-            face = cv2.resize(face, (224, 224))
-            face = img_to_array(face)
-            face = preprocess_input(face)
-
-            faces.append(face)
-            locations.append((startX, startY, endX, endY))
-
-    if faces:
-        faces = np.array(faces, dtype="float32")
-        predictions = mask_net.predict(faces, batch_size=32)
-
-    return (locations, predictions)
-
-# Streamlit UI
-def main():
-    # Header
-    st.markdown("<h1>😷 Face Mask Detection System</h1>", unsafe_allow_html=True)
-    st.markdown("<p class='subtitle'>AI-Powered Real-Time Detection System</p>", unsafe_allow_html=True)
-    
-    # Initialize session state
+def initialize_session_state():
+    """Initialize all session state variables"""
     if "detection" not in st.session_state:
         st.session_state.detection = False
     if "mask_count" not in st.session_state:
@@ -160,123 +115,177 @@ def main():
         st.session_state.no_mask_count = 0
     if "total_detections" not in st.session_state:
         st.session_state.total_detections = 0
+    if "total_violations" not in st.session_state:
+        st.session_state.total_violations = 0
+    if "current_alert" not in st.session_state:
+        st.session_state.current_alert = None
 
-    # Main content area
-    col1, col2, col3 = st.columns([1, 2, 1])
-    
-    with col2:
-        # Control buttons
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            if st.button("🎥 Start Detection", key="start"):
-                st.session_state.detection = True
-                st.rerun()
-        with btn_col2:
-            if st.button("⏹️ Stop Detection", key="stop"):
-                st.session_state.detection = False
-                st.rerun()
+# Load model
+@st.cache_resource
+def load_detection_models():
+    return load_models()
 
-    # Statistics cards
+def get_alert_system():
+    if "alert_system" not in st.session_state:
+        st.session_state.alert_system = AlertSystem(alert_cooldown=5)
+    return st.session_state.alert_system
+
+
+def render_header():
+    """Render application header"""
+    st.markdown("<h1>😷 Face Mask Detection System with Alerts</h1>", unsafe_allow_html=True)
+    st.markdown("<p class='subtitle'>AI-Powered Detection with Beep Sound & Voice Warnings</p>", unsafe_allow_html=True)
+
+
+def render_statistics():
+    """Render statistics cards"""
     stat_col1, stat_col2, stat_col3 = st.columns(3)
-    
-    with stat_col2:
-        st.markdown(f"""
-        <div class='stats-card'>
-            <div class='mask-icon'>✅</div>
-            <p class='stats-number' style='color: #10b981;'>{st.session_state.mask_count}</p>
-            <p class='stats-label'>With Mask</p>
-        </div>
-        """, unsafe_allow_html=True)
     
     with stat_col1:
         st.markdown(f"""
         <div class='stats-card'>
-            <div class='mask-icon'>📊</div>
+            <div style='font-size: 2.5rem;'>📊</div>
             <p class='stats-number' style='color: #667eea;'>{st.session_state.total_detections}</p>
             <p class='stats-label'>Total Detections</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with stat_col2:
+        st.markdown(f"""
+        <div class='stats-card'>
+            <div style='font-size: 2.5rem;'>✅</div>
+            <p class='stats-number' style='color: #10b981;'>{st.session_state.mask_count}</p>
+            <p class='stats-label'>With Mask</p>
         </div>
         """, unsafe_allow_html=True)
     
     with stat_col3:
         st.markdown(f"""
         <div class='stats-card'>
-            <div class='mask-icon'>⚠️</div>
+            <div style='font-size: 2.5rem;'>⚠️</div>
             <p class='stats-number' style='color: #ef4444;'>{st.session_state.no_mask_count}</p>
             <p class='stats-label'>Without Mask</p>
         </div>
         """, unsafe_allow_html=True)
+    
+    
 
-    # Video feed container
-    st.markdown("<div class='video-container'>", unsafe_allow_html=True)
-    stframe = st.empty()
-    st.markdown("</div>", unsafe_allow_html=True)
+def render_control_buttons():
+    """Render start/stop buttons"""
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        btn_col1, btn_col2 = st.columns(2)
+        
+        with btn_col1:
+            if st.button("🎥 Start Detection", key="start"):
+                st.session_state.detection = True
+                st.rerun()
+                
+        
+        with btn_col2:
+            if st.button("⏹️ Stop Detection", key="stop"):
+                st.session_state.detection = False
+                st.session_state.current_alert = None
+                st.rerun()
+               
+def render_alert_notification():
+    if st.session_state.current_alert:
+        st.markdown(f"🚨 ALERT: {st.session_state.current_alert}")
 
-    # Detection logic
-    if st.session_state.detection:
-        face_net, mask_net = load_models()
-        cap = cv2.VideoCapture(0)
 
-        if not cap.isOpened():
-            st.error("❌ Unable to access camera. Please check your camera permissions.")
-            st.session_state.detection = False
-            return
+# ============================================
+# MAIN DETECTION LOOP
+# ============================================
+def run_detection(face_net, mask_net, alert_system, stframe):
+    """Run the main detection loop"""
+    # Ensure audio is ready (in case of restart)
+    alert_system._init_audio()
+    
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        st.error("❌ Unable to access camera. Please check your camera permissions.")
+        st.session_state.detection = False
+        return
 
+    try:
         while st.session_state.detection:
             ret, frame = cap.read()
             if not ret:
                 st.error("❌ Failed to capture frame from camera.")
                 break
 
-            frame = cv2.resize(frame, (640, int(frame.shape[0] * 640 / frame.shape[1])))
+            frame = resize_frame(frame, width=640)
             locations, predictions = detect_and_predict_mask(frame, face_net, mask_net)
+            frame, mask_count, no_mask_count = draw_detection_results(frame, locations, predictions, show_confidence=True)
 
-            current_mask = 0
-            current_no_mask = 0
+            # Update statistics
+            st.session_state.mask_count = mask_count
+            st.session_state.no_mask_count = no_mask_count
+            st.session_state.total_detections = mask_count + no_mask_count
 
-            for (box, pred) in zip(locations, predictions):
-                (startX, startY, endX, endY) = box
-                (mask, withoutMask) = pred
-                label = "Mask" if mask > withoutMask else "No Mask"
-                color = (0, 255, 0) if label == "Mask" else (0, 0, 255)
-                
-                if label == "Mask":
-                    current_mask += 1
-                else:
-                    current_no_mask += 1
-                
-                confidence = max(mask, withoutMask) * 100
-                label_text = "{}: {:.2f}%".format(label, confidence)
-
-                # Draw rounded rectangle effect
-                cv2.rectangle(frame, (startX, startY), (endX, endY), color, 3)
-                
-                # Label background
-                label_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-                cv2.rectangle(frame, (startX, startY - 35), (startX + label_size[0] + 10, startY), color, -1)
-                
-                # Label text
-                cv2.putText(frame, label_text, (startX + 5, startY - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Update stats
-            if current_mask > 0 or current_no_mask > 0:
-                st.session_state.mask_count = current_mask
-                st.session_state.no_mask_count = current_no_mask
-                st.session_state.total_detections = current_mask + current_no_mask
+            # Trigger alert
+            if no_mask_count > 0:
+                alert_triggered = alert_system.trigger_alert(no_mask_count)
+                if alert_triggered:
+                    st.session_state.current_alert = (
+                        "1 person without mask detected!"
+                        if no_mask_count == 1
+                        else f"{no_mask_count} persons without masks detected!"
+                    )
+            else:
+                st.session_state.current_alert = None
 
             stframe.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), channels="RGB", use_container_width=True)
 
+    finally:
         cap.release()
+      
+
+# ============================================
+# MAIN APPLICATION
+# ============================================
+def main():
+    """Main application function"""
+    # Initialize session state
+    initialize_session_state()
+    
+    # Load models and alert system
+    face_net, mask_net = load_detection_models()
+    alert_system = get_alert_system()
+    
+    # Render UI
+    render_header()
+    render_control_buttons()
+    render_statistics()
+    render_alert_notification()
+    
+    # Video feed container
+    st.markdown("<div class='video-container'>", unsafe_allow_html=True)
+    stframe = st.empty()
+    st.markdown("</div>", unsafe_allow_html=True)
+    
+    
+    
+    # Run detection or show placeholder
+    if st.session_state.detection:
+        run_detection(face_net, mask_net, alert_system, stframe)
     else:
         # Display placeholder when not detecting
         placeholder_html = """
         <div style='text-align: center; padding: 4rem 2rem; background: #f8f9fa; border-radius: 15px;'>
             <div style='font-size: 5rem; margin-bottom: 1rem;'>📷</div>
             <h3 style='color: #666; margin-bottom: 1rem;'>Camera Ready</h3>
-            <p style='color: #999;'>Click "Start Detection" to begin</p>
+            <p style='color: #999;'>Click "Start Detection" to begin monitoring</p>
+            <p style='color: #999; margin-top: 1rem;'>
+                When a person without mask is detected:<br>
+                🔔 Beep sound will play<br>
+                🔊 Voice warning will announce the person count
+            </p>
         </div>
         """
         stframe.markdown(placeholder_html, unsafe_allow_html=True)
+
 
 if __name__ == "__main__":
     main()
